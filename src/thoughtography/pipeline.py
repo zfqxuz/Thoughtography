@@ -37,8 +37,8 @@ def _normalise_text(text: str) -> str:
 
 
 _DUPLICATE_SIMILARITY_THRESHOLD = 0.70
-_DUPLICATE_MERGE_GAP_SECONDS = 1.0
-_DUPLICATE_LOOKBACK = 12
+_DUPLICATE_MERGE_GAP_SECONDS = 3.0
+_DUPLICATE_CROSS_CLASS_MIN_LENGTH = 4
 
 
 def _text_similarity(first: str, second: str) -> float:
@@ -56,89 +56,106 @@ def _text_similarity(first: str, second: str) -> float:
     return SequenceMatcher(None, first_norm, second_norm).ratio()
 
 
+def _same_classification(first: ScriptLine, second: ScriptLine) -> bool:
+    return (
+        first.kind == second.kind
+        and first.speaker.strip() == second.speaker.strip()
+    )
+
+
+def _lines_are_duplicates(first: ScriptLine, second: ScriptLine) -> bool:
+    if first.start > second.end + _DUPLICATE_MERGE_GAP_SECONDS:
+        return False
+
+    first_norm = _normalise_text(first.display_text)
+    second_norm = _normalise_text(second.display_text)
+    if not first_norm or not second_norm:
+        return False
+
+    same_speaker = first.speaker.strip() == second.speaker.strip()
+    same_kind = first.kind == second.kind
+    min_length = min(len(first_norm), len(second_norm))
+    if first_norm == second_norm:
+        if same_speaker and same_kind:
+            return True
+        # The model may switch the same on-screen line between narration and
+        # dialogue. Only merge exact long text across that boundary.
+        return min_length >= _DUPLICATE_CROSS_CLASS_MIN_LENGTH
+
+    if not same_speaker:
+        return False
+
+    similarity = _text_similarity(first.display_text, second.display_text)
+    if min_length >= _DUPLICATE_CROSS_CLASS_MIN_LENGTH:
+        # Same speaker can still be classified as narration in one keyframe and
+        # dialogue in another; allow fuzzy merge when the text is long enough.
+        return similarity >= _DUPLICATE_SIMILARITY_THRESHOLD
+    return same_kind and similarity >= _DUPLICATE_SIMILARITY_THRESHOLD
+
+
 def _deduplicate_lines(lines: list[ScriptLine]) -> list[ScriptLine]:
-    ordered = sorted(lines, key=lambda line: (line.start, line.end, line.speaker))
-    deduped: list[ScriptLine] = []
-    for line in ordered:
-        if not line.display_text.strip():
-            continue
+    """Merge repeated/typewriter/overlapping state lines across keyframes."""
+    ordered = sorted(
+        (line for line in lines if line.display_text.strip()),
+        key=lambda line: (line.start, line.end, line.speaker),
+    )
+    if not ordered:
+        return []
 
-        best_index: int | None = None
-        best_score = 0.0
-        # Look back a little so a short extra line between two variants does not
-        # stop the variants from being merged.
-        for index in range(
-            len(deduped) - 1,
-            max(-1, len(deduped) - _DUPLICATE_LOOKBACK - 1),
-            -1,
-        ):
-            candidate = deduped[index]
-            if line.start > candidate.end + _DUPLICATE_MERGE_GAP_SECONDS:
-                continue
+    # Pairwise union-find keeps transitivity: A~B and B~C should collapse even
+    # when A and C are slightly further apart in time.
+    parent = list(range(len(ordered)))
 
-            same_classification = (
-                candidate.kind == line.kind
-                and candidate.speaker.strip() == line.speaker.strip()
-            )
-            candidate_text = _normalise_text(candidate.display_text)
-            line_text = _normalise_text(line.display_text)
-            exact_duplicate = candidate_text == line_text
-            if exact_duplicate and (same_classification or len(line_text) >= 4):
-                # The model may switch the same line between narration and
-                # dialogue; merge exact duplicates even across that boundary.
-                score = 1.0
-            elif same_classification:
-                score = _text_similarity(candidate.display_text, line.display_text)
-            else:
-                continue
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
 
-            if score < _DUPLICATE_SIMILARITY_THRESHOLD:
-                continue
-            tied_better_time = (
-                score == best_score
-                and (
-                    best_index is None
-                    or candidate.start < deduped[best_index].start
-                )
-            )
-            if score > best_score or tied_better_time:
-                best_index = index
-                best_score = score
+    def union(first: int, second: int) -> None:
+        root_first = find(first)
+        root_second = find(second)
+        if root_first != root_second:
+            parent[root_second] = root_first
 
-        if best_index is None:
-            deduped.append(replace(line))
-            continue
+    for index, line in enumerate(ordered):
+        end_limit = line.end + _DUPLICATE_MERGE_GAP_SECONDS
+        other = index + 1
+        while other < len(ordered) and ordered[other].start <= end_limit:
+            if _lines_are_duplicates(line, ordered[other]):
+                union(index, other)
+            other += 1
 
-        candidate = deduped[best_index]
-        candidate_norm = _normalise_text(candidate.display_text)
-        line_norm = _normalise_text(line.display_text)
-        exact_duplicate = candidate_norm == line_norm
-        classification_differs = (
-            candidate.kind != line.kind
-            or candidate.speaker.strip() != line.speaker.strip()
+    groups: dict[int, list[int]] = {}
+    for index in range(len(ordered)):
+        groups.setdefault(find(index), []).append(index)
+
+    merged: list[ScriptLine] = []
+    for indexes in groups.values():
+        # Keep the most complete text version. On equal length prefer higher
+        # confidence, then dialogue, then the earlier occurrence.
+        representative = max(
+            indexes,
+            key=lambda item: (
+                len(_normalise_text(ordered[item].display_text)),
+                ordered[item].confidence,
+                ordered[item].kind == "dialogue",
+                -ordered[item].start,
+            ),
         )
-        prefer_line_classification = exact_duplicate and classification_differs and (
-            line.confidence > candidate.confidence
-            or (
-                line.confidence == candidate.confidence
-                and line.kind == "dialogue"
-                and candidate.kind != "dialogue"
+        best = ordered[representative]
+        merged.append(
+            replace(
+                best,
+                start=min(ordered[item].start for item in indexes),
+                end=max(ordered[item].end for item in indexes),
+                confidence=max(ordered[item].confidence for item in indexes),
             )
         )
 
-        # Keep the longest visible text; it is usually the most complete frame
-        # of a typewriter animation.
-        if len(line.display_text) > len(candidate.display_text) or prefer_line_classification:
-            candidate.text_zh = line.text_zh
-            candidate.text_original = line.text_original
-        if prefer_line_classification:
-            candidate.kind = line.kind
-            candidate.speaker = line.speaker
-        candidate.start = min(candidate.start, line.start)
-        candidate.end = max(candidate.end, line.end)
-        candidate.confidence = max(candidate.confidence, line.confidence)
+    return sorted(merged, key=lambda line: (line.start, line.end, line.speaker))
 
-    return sorted(deduped, key=lambda line: (line.start, line.end, line.speaker))
+
 
 
 def _build_scenes(

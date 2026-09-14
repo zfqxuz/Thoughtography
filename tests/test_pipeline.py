@@ -108,3 +108,46 @@ def test_deduplicate_keeps_short_exact_text_across_speakers() -> None:
     merged = _deduplicate_lines(lines)
 
     assert [line.display_text for line in merged] == ["好", "好"]
+
+
+def test_deduplicate_merges_same_speaker_across_kind() -> None:
+    lines = [
+        ScriptLine(
+            start=49.0,
+            end=51.0,
+            speaker="旁白",
+            kind="dialogue",
+            text_original="月符「Remilia face 蕾米莉亚之面」",
+            text_zh="月符「Remilia face 蕾米莉亚之面」",
+            confidence=0.9,
+        ),
+        ScriptLine(
+            start=51.0,
+            end=53.5,
+            speaker="旁白",
+            kind="narration",
+            text_original="月符「Remilia_face 蕾米莉亚之面」",
+            text_zh="月符「Remilia_face 蕾米莉亚之面」",
+            confidence=0.9,
+        ),
+    ]
+
+    merged = _deduplicate_lines(lines)
+
+    assert len(merged) == 1
+    assert merged[0].start == 49.0
+    assert merged[0].end == 53.5
+
+
+def test_deduplicate_merges_overlapping_combined_text() -> None:
+    lines = [
+        _line(75.5, 76.5, "真正的乐园纯洁无瑕"),
+        _line(76.5, 77.0, "真正的乐园纯洁无瑕\n渴望乐园的人啊，去寻求三把钥匙吧"),
+    ]
+
+    merged = _deduplicate_lines(lines)
+
+    assert len(merged) == 1
+    assert merged[0].start == 75.5
+    assert merged[0].end == 77.0
+    assert "渴望乐园的人啊" in merged[0].display_text
