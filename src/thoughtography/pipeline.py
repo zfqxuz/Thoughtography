@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -34,6 +38,45 @@ class ExtractionResult:
 
 def _normalise_text(text: str) -> str:
     return "".join(text.split()).casefold()
+
+
+_GENERIC_SPEAKER_NAMES = {"", "未知", "未知角色", "未知少女", "未知人物", "不明", "角色不明"}
+
+
+def _is_generic_speaker(speaker: str) -> bool:
+    value = speaker.strip()
+    return value in _GENERIC_SPEAKER_NAMES or value.startswith("未知")
+
+
+def _resolve_unknown_speakers(analysis: WindowAnalysis) -> None:
+    """Turn generic speaker labels into the most concrete label available.
+
+    The model already receives a growing confirmed-name list, but on first
+    appearance it may still answer "未知角色".  Prefer a parenthesized visual
+    descriptor (e.g. "未知角色（紫发少女）" -> "紫发少女"), or the only visible
+    character's name when the frame has exactly one character.
+    """
+    character_names: list[str] = []
+    for item in analysis.characters:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name and not _is_generic_speaker(name):
+            character_names.append(name)
+
+    single_character = character_names[0] if len(character_names) == 1 else None
+    for line in analysis.lines:
+        speaker = line.speaker.strip()
+        if not _is_generic_speaker(speaker):
+            continue
+        match = re.search(r"[（(]([^（）()]+)[）)]", speaker)
+        if match:
+            descriptor = match.group(1).strip()
+            if descriptor and not _is_generic_speaker(descriptor):
+                line.speaker = descriptor
+                continue
+        if single_character:
+            line.speaker = single_character
 
 
 _DUPLICATE_SIMILARITY_THRESHOLD = 0.70
@@ -362,34 +405,68 @@ def run_extract(
     known_characters: list[str] = []
     vision_calls = 0
 
-    with VisionClient(provider_config) as client:
-        for keyframe in keyframes:
-            try:
-                logger.info(
-                    "分析关键帧 %s/%s  %s - %s",
-                    keyframe.index + 1,
-                    len(keyframes),
-                    keyframe.start,
-                    keyframe.end,
-                )
+    concurrency = max(1, int(os.environ.get("THOUGHTOGRAPHY_CONCURRENCY", "1") or "1"))
+    known_lock = threading.Lock()
+    analyses_by_index: dict[int, WindowAnalysis] = {}
+    errors_by_index: dict[int, str] = {}
+
+    def analyze_one(keyframe: Keyframe) -> tuple[int, WindowAnalysis | None, str | None]:
+        try:
+            with known_lock:
+                known_snapshot = list(known_characters)
+            with VisionClient(provider_config) as client:
                 analysis = client.analyze(
                     keyframe,
                     media,
                     user_hint=user_hint,
-                    known_characters=known_characters,
+                    known_characters=known_snapshot,
                     cache_dir=vision_cache_dir,
                 )
-                vision_calls += 1
-                analyses.append(analysis)
+            _resolve_unknown_speakers(analysis)
+            with known_lock:
                 for item in analysis.characters:
                     if isinstance(item, dict):
                         name = str(item.get("name") or "").strip()
                         if name and name not in known_characters:
                             known_characters.append(name)
-            except Exception as exc:  # noqa: BLE001 - continue other keyframes
-                message = f"关键帧 {keyframe.index} ({keyframe.start:.3f}s) 分析失败: {exc}"
-                logger.warning(message)
-                errors.append(message)
+            return keyframe.index, analysis, None
+        except Exception as exc:  # noqa: BLE001 - surfaced through the caller
+            return (
+                keyframe.index,
+                None,
+                f"关键帧 {keyframe.index} ({keyframe.start:.3f}s) 分析失败: {exc}",
+            )
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(analyze_one, keyframe) for keyframe in keyframes]
+        for future in as_completed(futures):
+            index, analysis, error = future.result()
+            completed += 1
+            if error is not None:
+                errors_by_index[index] = error
+                logger.warning(error)
+                continue
+            assert analysis is not None
+            analyses_by_index[index] = analysis
+            logger.info(
+                "完成关键帧 %s/%s  %s - %s  (并发=%s)",
+                index + 1,
+                len(keyframes),
+                keyframes[index].start,
+                keyframes[index].end,
+                concurrency,
+            )
+
+    analyses = [
+        analyses_by_index[index]
+        for index in sorted(analyses_by_index)
+    ]
+    errors = [
+        errors_by_index[index]
+        for index in sorted(errors_by_index)
+    ]
+    vision_calls = len(analyses)
 
     if not analyses:
         raise RuntimeError("所有关键帧分析都失败了，请检查模型配置。\n" + "\n".join(errors))

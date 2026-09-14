@@ -1,5 +1,5 @@
-from thoughtography.models import ScriptLine
-from thoughtography.pipeline import _deduplicate_lines
+from thoughtography.models import Keyframe, ScriptLine, WindowAnalysis
+from thoughtography.pipeline import _deduplicate_lines, _resolve_unknown_speakers
 
 
 def _line(start: float, end: float, text: str, speaker: str = "旁白", kind: str = "narration") -> ScriptLine:
@@ -151,3 +151,47 @@ def test_deduplicate_merges_overlapping_combined_text() -> None:
     assert merged[0].start == 75.5
     assert merged[0].end == 77.0
     assert "渴望乐园的人啊" in merged[0].display_text
+
+
+def _analysis_with(characters: list[dict], speakers: list[str]) -> WindowAnalysis:
+    return WindowAnalysis(
+        keyframe=Keyframe(index=0, start=0.0, end=1.0, path=__import__("pathlib").Path("frame.jpg")),
+        characters=characters,
+        lines=[_line(0.0, 1.0, f"line-{index}", speaker) for index, speaker in enumerate(speakers)],
+    )
+
+
+def test_resolve_unknown_speakers_uses_parenthesized_descriptor() -> None:
+    analysis = _analysis_with(
+        characters=[{"name": "紫发少女", "description": "紫色长发"}],
+        speakers=["未知角色（紫发少女）"],
+    )
+
+    _resolve_unknown_speakers(analysis)
+
+    assert analysis.lines[0].speaker == "紫发少女"
+
+
+def test_resolve_unknown_speakers_uses_single_character_name() -> None:
+    analysis = _analysis_with(
+        characters=[{"name": "橙发少女", "description": "橙发、红白格子衣"}],
+        speakers=["未知角色"],
+    )
+
+    _resolve_unknown_speakers(analysis)
+
+    assert analysis.lines[0].speaker == "橙发少女"
+
+
+def test_resolve_unknown_speakers_keeps_generic_when_ambiguous() -> None:
+    analysis = _analysis_with(
+        characters=[
+            {"name": "橙发少女", "description": ""},
+            {"name": "紫发少女", "description": ""},
+        ],
+        speakers=["未知角色"],
+    )
+
+    _resolve_unknown_speakers(analysis)
+
+    assert analysis.lines[0].speaker == "未知角色"
