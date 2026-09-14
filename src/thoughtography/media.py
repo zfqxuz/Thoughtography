@@ -133,22 +133,35 @@ def probe_video(path: Path) -> VideoInfo:
             has_audio=any(s.get("codec_type") == "audio" for s in streams),
         )
 
-    # Fallback: parse `ffmpeg -i` stderr if ffprobe is unavailable.
+    # Fallback: parse the full `ffmpeg -i` stderr when ffprobe is unavailable.
+    # `run_command` only reports the tail of stderr on failure, but duration and
+    # stream information appear near the top, so probe directly here.
     command = [find_ffmpeg(), "-hide_banner", "-i", str(path)]
     try:
-        run_command(command, timeout=60)
-    except FFmpegError as exc:
-        text = str(exc)
-        duration, width, height, fps, has_audio = _parse_ffmpeg_probe_text(text)
-        return VideoInfo(
-            path=path,
-            duration=duration,
-            width=width,
-            height=height,
-            fps=fps,
-            has_audio=has_audio,
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
         )
-    raise FFmpegError(f"无法读取视频信息: {path}")
+    except subprocess.TimeoutExpired as exc:
+        raise FFmpegError(f"读取视频信息超时: {path}") from exc
+
+    text = completed.stderr or completed.stdout or ""
+    duration, width, height, fps, has_audio = _parse_ffmpeg_probe_text(text)
+    if duration <= 0 or width <= 0 or height <= 0:
+        detail = "\n".join(text.strip().splitlines()[:8]) or "无输出"
+        raise FFmpegError(f"无法读取视频信息: {path}\n{detail}")
+    return VideoInfo(
+        path=path,
+        duration=duration,
+        width=width,
+        height=height,
+        fps=fps,
+        has_audio=has_audio,
+    )
 
 
 def extract_preview_frames(

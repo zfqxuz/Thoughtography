@@ -4,6 +4,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .config import ProviderConfig
@@ -35,23 +36,109 @@ def _normalise_text(text: str) -> str:
     return "".join(text.split()).casefold()
 
 
+_DUPLICATE_SIMILARITY_THRESHOLD = 0.70
+_DUPLICATE_MERGE_GAP_SECONDS = 1.0
+_DUPLICATE_LOOKBACK = 12
+
+
+def _text_similarity(first: str, second: str) -> float:
+    """Fuzzy similarity for typewriter-style repeated dialogue variants."""
+    first_norm = _normalise_text(first)
+    second_norm = _normalise_text(second)
+    if not first_norm or not second_norm:
+        return 0.0
+    if first_norm == second_norm:
+        return 1.0
+    shorter, longer = sorted((first_norm, second_norm), key=len)
+    # Partial text can appear while text is still being typed/translated.
+    if len(shorter) >= 3 and shorter in longer:
+        return max(0.9, len(shorter) / len(longer))
+    return SequenceMatcher(None, first_norm, second_norm).ratio()
+
+
 def _deduplicate_lines(lines: list[ScriptLine]) -> list[ScriptLine]:
     ordered = sorted(lines, key=lambda line: (line.start, line.end, line.speaker))
     deduped: list[ScriptLine] = []
     for line in ordered:
         if not line.display_text.strip():
             continue
-        if deduped:
-            previous = deduped[-1]
-            same_text = _normalise_text(previous.display_text) == _normalise_text(line.display_text)
-            same_speaker = previous.speaker.strip() == line.speaker.strip()
-            close_in_time = line.start <= previous.end + 1.0
-            if same_text and same_speaker and close_in_time:
-                previous.end = max(previous.end, line.end)
-                previous.confidence = max(previous.confidence, line.confidence)
+
+        best_index: int | None = None
+        best_score = 0.0
+        # Look back a little so a short extra line between two variants does not
+        # stop the variants from being merged.
+        for index in range(
+            len(deduped) - 1,
+            max(-1, len(deduped) - _DUPLICATE_LOOKBACK - 1),
+            -1,
+        ):
+            candidate = deduped[index]
+            if line.start > candidate.end + _DUPLICATE_MERGE_GAP_SECONDS:
                 continue
-        deduped.append(replace(line))
-    return deduped
+
+            same_classification = (
+                candidate.kind == line.kind
+                and candidate.speaker.strip() == line.speaker.strip()
+            )
+            candidate_text = _normalise_text(candidate.display_text)
+            line_text = _normalise_text(line.display_text)
+            exact_duplicate = candidate_text == line_text
+            if exact_duplicate and (same_classification or len(line_text) >= 4):
+                # The model may switch the same line between narration and
+                # dialogue; merge exact duplicates even across that boundary.
+                score = 1.0
+            elif same_classification:
+                score = _text_similarity(candidate.display_text, line.display_text)
+            else:
+                continue
+
+            if score < _DUPLICATE_SIMILARITY_THRESHOLD:
+                continue
+            tied_better_time = (
+                score == best_score
+                and (
+                    best_index is None
+                    or candidate.start < deduped[best_index].start
+                )
+            )
+            if score > best_score or tied_better_time:
+                best_index = index
+                best_score = score
+
+        if best_index is None:
+            deduped.append(replace(line))
+            continue
+
+        candidate = deduped[best_index]
+        candidate_norm = _normalise_text(candidate.display_text)
+        line_norm = _normalise_text(line.display_text)
+        exact_duplicate = candidate_norm == line_norm
+        classification_differs = (
+            candidate.kind != line.kind
+            or candidate.speaker.strip() != line.speaker.strip()
+        )
+        prefer_line_classification = exact_duplicate and classification_differs and (
+            line.confidence > candidate.confidence
+            or (
+                line.confidence == candidate.confidence
+                and line.kind == "dialogue"
+                and candidate.kind != "dialogue"
+            )
+        )
+
+        # Keep the longest visible text; it is usually the most complete frame
+        # of a typewriter animation.
+        if len(line.display_text) > len(candidate.display_text) or prefer_line_classification:
+            candidate.text_zh = line.text_zh
+            candidate.text_original = line.text_original
+        if prefer_line_classification:
+            candidate.kind = line.kind
+            candidate.speaker = line.speaker
+        candidate.start = min(candidate.start, line.start)
+        candidate.end = max(candidate.end, line.end)
+        candidate.confidence = max(candidate.confidence, line.confidence)
+
+    return sorted(deduped, key=lambda line: (line.start, line.end, line.speaker))
 
 
 def _build_scenes(
