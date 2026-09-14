@@ -181,8 +181,38 @@ def bili(
     skip_download: bool = typer.Option(
         False, "--skip-download", help="输出目录已有视频时跳过下载"
     ),
+    label_speakers: bool = typer.Option(
+        True,
+        "--label-speakers/--no-label-speakers",
+        help="用视觉模型为 OCR 行标注说话角色（需要模型配置）",
+    ),
+    speaker_provider: str = typer.Option(
+        "dsh", "--speaker-provider", help="说话人标注使用的 provider"
+    ),
+    speaker_concurrency: int = typer.Option(
+        4, "--speaker-concurrency", help="说话人标注并发数"
+    ),
+    speaker_seed: Path | None = typer.Option(
+        None, "--speaker-seed", help="已知角色名单文件，每行一个名字"
+    ),
 ) -> None:
-    """用 peanutdl 解析 B 站视频，并用 RapidOCR 逐帧提取画面字幕。"""
+    """用 peanutdl 解析 B 站视频，RapidOCR 提取字幕，可选视觉模型标注说话人。"""
+    load_dotenv()
+    speaker_config = None
+    seed_names = None
+    if speaker_seed is not None:
+        if not speaker_seed.exists():
+            raise typer.BadParameter(f"角色名单文件不存在: {speaker_seed}")
+        seed_names = [
+            line.strip()
+            for line in speaker_seed.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    if label_speakers:
+        try:
+            speaker_config = load_provider_config(speaker_provider)
+        except ConfigError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     try:
         run_bili_ocr(
             url,
@@ -190,6 +220,10 @@ def bili(
             fps=fps,
             min_score=min_score,
             skip_download=skip_download,
+            speaker_labels=label_speakers,
+            speaker_config=speaker_config,
+            speaker_concurrency=speaker_concurrency,
+            speaker_seed=seed_names,
             log=typer.echo,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary

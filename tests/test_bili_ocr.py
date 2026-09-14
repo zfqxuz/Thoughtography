@@ -27,3 +27,26 @@ def test_dedupe_frame_detections_prefers_higher_score() -> None:
     kept = _dedupe_frame_detections(detections)
     assert [item["text"] for item in kept] == ["这是一个残酷的故事", "另一句"]
     assert kept[0]["score"] == 0.9
+
+
+def test_line_tag_uses_speaker_and_narration() -> None:
+    from thoughtography.bili_ocr import OcrLine, _line_tag
+
+    def line(speaker: str, kind: str, box_h: float = 120.0) -> OcrLine:
+        return OcrLine(
+            start=0.0,
+            end=1.0,
+            text="测试",
+            score=1.0,
+            center_x=10.0,
+            center_y=20.0,
+            box_w=20.0,
+            box_h=box_h,
+            speaker=speaker,
+            speaker_kind=kind,
+        )
+
+    assert _line_tag(line("蕾米莉亚", "dialogue")) == "【蕾米莉亚】"
+    assert _line_tag(line("红发少女", "narration")) == "【红发少女·旁白】"
+    assert _line_tag(line("旁白", "narration")) == "【旁白】"
+    assert _line_tag(line("", "dialogue")) == "【对白】"

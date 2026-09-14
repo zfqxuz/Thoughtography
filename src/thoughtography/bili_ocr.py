@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import httpx
+
+from .config import ProviderConfig
 
 from .media import find_ffmpeg, format_timestamp
 
@@ -57,6 +62,8 @@ class OcrLine:
     box_w: float
     box_h: float
     hits: int = 1
+    speaker: str = ""
+    speaker_kind: str = ""
 
     @property
     def vertical(self) -> bool:
@@ -72,6 +79,8 @@ class OcrLine:
             "box": [round(self.box_w, 1), round(self.box_h, 1)],
             "vertical": self.vertical,
             "hits": self.hits,
+            "speaker": self.speaker,
+            "speaker_kind": self.speaker_kind,
         }
 
 
@@ -424,6 +433,17 @@ def _format_mmss(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
+def _line_tag(line: OcrLine) -> str:
+    speaker = line.speaker.strip()
+    if speaker and not _speaker_is_generic(speaker):
+        if line.speaker_kind == "narration":
+            return f"【{speaker}·旁白】"
+        return f"【{speaker}】"
+    if line.speaker_kind == "narration" or speaker == "旁白":
+        return "【旁白】"
+    return "【对白】" if line.vertical else "【字幕】"
+
+
 def write_transcript(
     video: BiliVideo,
     lines: list[OcrLine],
@@ -442,7 +462,7 @@ def write_transcript(
         f"视频时长：{total_seconds // 60}分{total_seconds % 60:02d}秒",
         "说明：本视频由 RapidOCR 逐帧识别画面字幕生成；",
         "      台词以画面文字为准，已合并连续重复镜头。时间码为 mm:ss。",
-        "      【对白】表示竖排对话框，【字幕】表示横排字幕/旁白文字。",
+        "      【角色名】表示已标注说话人；【对白】/【字幕】/【旁白】用于未标注文字。",
         "      OCR 无法区分具体说话角色。",
         "=" * 80,
         "",
@@ -457,7 +477,7 @@ def write_transcript(
             continue
         if previous_end is not None and line.start - previous_end >= 2.0:
             body.append("")
-        tag = "【对白】" if line.vertical else "【字幕】"
+        tag = _line_tag(line)
         text_lines = [part for part in line.text.splitlines() if part.strip()] or [line.text]
         body.append(f"{_format_mmss(line.start)} {tag}{text_lines[0].strip()}")
         for extra in text_lines[1:]:
@@ -509,6 +529,233 @@ def clean_ocr_lines(
     return kept
 
 
+_GENERIC_SPEAKER_NAMES = {"", "未知", "未知角色", "未知少女", "旁白", "不明"}
+
+
+def _speaker_is_generic(speaker: str) -> bool:
+    value = speaker.strip()
+    return value in _GENERIC_SPEAKER_NAMES or value.startswith("未知")
+
+
+def _nearest_frame(frames_dir: Path, timestamp: float, fps: float) -> Path | None:
+    target = int(round(timestamp * fps))
+    direct = frames_dir / f"frame_{target:06d}.jpg"
+    if direct.exists():
+        return direct
+    files = sorted(frames_dir.glob("frame_*.jpg"))
+    if not files:
+        return None
+    return min(files, key=lambda path: abs(int(path.stem.split("_")[-1]) - target))
+
+
+def _extract_json_object(content: str) -> dict[str, Any]:
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end <= start:
+        raise BiliOcrError(f"说话人模型没有返回 JSON: {content[:200]}")
+    return json.loads(content[start : end + 1])
+
+
+def _call_speaker_model(
+    config: ProviderConfig,
+    prompt: str,
+    image_path: Path,
+    cache_path: Path,
+) -> list[dict[str, Any]]:
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    payload = {
+        "model": config.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是视觉小说/手书视频的角色识别助手。只根据画面证据判断说话人，不要编造。\n"
+                    "图中红框已框出 OCR 文字区域并编号。你不需要重新识别文字，只判断每个编号是谁在说。\n"
+                    "优先使用画面可见的人物名牌或已被确认的角色名；没有名字时用稳定的外观描述命名。\n"
+                    "旁白、文字卡、制作字幕等的 kind 填 narration；有明确角色对话框的 kind 填 dialogue。\n"
+                    "完全无法判断时 speaker 填 \"未知\"。\n"
+                    "只输出 JSON：{\"labels\":[{\"id\":1,\"speaker\":\"角色名\",\"kind\":\"dialogue\"}]}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,"
+                            + base64.b64encode(image_path.read_bytes()).decode("ascii")
+                        },
+                    },
+                ],
+            },
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+    }
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = httpx.post(
+                config.chat_url,
+                headers=headers,
+                json=payload,
+                timeout=config.timeout_sec,
+            )
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise BiliOcrError(f"说话人模型暂时不可用 ({response.status_code})")
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"].get("content") or ""
+            parsed = _extract_json_object(content)
+            labels = parsed.get("labels")
+            if not isinstance(labels, list):
+                raise BiliOcrError("说话人模型返回的 labels 不是数组")
+            clean_labels = []
+            for item in labels:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    label_id = int(item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                clean_labels.append(
+                    {
+                        "id": label_id,
+                        "speaker": str(item.get("speaker") or "").strip(),
+                        "kind": str(item.get("kind") or "dialogue").strip().lower(),
+                    }
+                )
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(clean_labels, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return clean_labels
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < 2:
+                import time
+
+                time.sleep(2 ** attempt)
+    raise BiliOcrError(f"说话人标注失败: {last_error}")
+
+
+def label_speakers(
+    lines: list[OcrLine],
+    frames_dir: Path,
+    config: ProviderConfig,
+    *,
+    cache_dir: Path,
+    fps: float = 1.0,
+    concurrency: int = 4,
+    seed_names: list[str] | None = None,
+    log: Callable[[str], None] = print,
+) -> list[OcrLine]:
+    """Use the vision model on annotated keyframes to assign speakers to OCR lines."""
+    if not lines:
+        return lines
+    from PIL import Image, ImageDraw
+
+    groups: dict[int, list[int]] = {}
+    for index, line in enumerate(lines):
+        groups.setdefault(int(round(line.start)), []).append(index)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    known = [name.strip() for name in (seed_names or []) if name.strip()]
+    lock = threading.Lock()
+
+    def work(timestamp: int, _group: list[int]) -> tuple[int, list[tuple[int, str, str]]]:
+        tolerance = 1.0 / max(fps, 0.1)
+        active = [
+            (index, line)
+            for index, line in enumerate(lines)
+            if line.start - tolerance <= timestamp <= line.end + tolerance
+        ]
+        if not active:
+            return timestamp, []
+        frame = _nearest_frame(frames_dir, float(timestamp), fps)
+        if frame is None:
+            return timestamp, []
+
+        image = Image.open(frame).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        for label_id, (_index, line) in enumerate(active, 1):
+            cx, cy = line.center_x, line.center_y
+            half_w = max(8.0, line.box_w / 2) + 5
+            half_h = max(8.0, line.box_h / 2) + 5
+            draw.rectangle(
+                [cx - half_w, cy - half_h, cx + half_w, cy + half_h],
+                outline="red",
+                width=2,
+            )
+            draw.text((cx - half_w + 2, cy - half_h + 1), str(label_id), fill="red")
+        annotated = cache_dir / f"annotated_{timestamp:06d}.jpg"
+        image.save(annotated, quality=88)
+
+        with lock:
+            known_snapshot = list(known)
+        known_text = "、".join(known_snapshot[:40]) if known_snapshot else "暂无"
+        listing = "\n".join(
+            f"{label_id}. {line.text[:60]}"
+            for label_id, (_index, line) in enumerate(active, 1)
+        )
+        prompt = (
+            f"时间 {timestamp} 秒。已知角色名单：{known_text}\n"
+            f"红框编号与 OCR 文字：\n{listing}\n"
+            "请判断每个编号的说话人和类型。不要重新识别文字。"
+        )
+        labels = _call_speaker_model(
+            config,
+            prompt,
+            annotated,
+            cache_dir / f"labels_{timestamp:06d}.json",
+        )
+        by_id = {item["id"]: item for item in labels}
+        result: list[tuple[int, str, str]] = []
+        for label_id, (index, _line) in enumerate(active, 1):
+            item = by_id.get(label_id)
+            if not item:
+                continue
+            speaker = item["speaker"]
+            kind = item["kind"] if item["kind"] in {"dialogue", "narration"} else "dialogue"
+            if not speaker:
+                continue
+            result.append((index, speaker, kind))
+            if not _speaker_is_generic(speaker):
+                with lock:
+                    if speaker not in known:
+                        known.append(speaker)
+        return timestamp, result
+
+    applied: list[tuple[int, int, str, str]] = []
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        futures = [executor.submit(work, timestamp, group) for timestamp, group in sorted(groups.items())]
+        done = 0
+        for future in as_completed(futures):
+            timestamp, result = future.result()
+            for index, speaker, kind in result:
+                applied.append((timestamp, index, speaker, kind))
+            done += 1
+            if done % 20 == 0 or done == len(futures):
+                log(f"  说话人标注: {done}/{len(futures)}")
+
+    for _timestamp, index, speaker, kind in sorted(applied, key=lambda item: item[0]):
+        line = lines[index]
+        line.speaker = speaker
+        line.speaker_kind = kind
+    return lines
+
+
 def run_bili_ocr(
     url: str,
     output_dir: Path,
@@ -516,6 +763,10 @@ def run_bili_ocr(
     fps: float = 1.0,
     min_score: float = 0.6,
     skip_download: bool = False,
+    speaker_labels: bool = False,
+    speaker_config: ProviderConfig | None = None,
+    speaker_concurrency: int = 4,
+    speaker_seed: list[str] | None = None,
     log: Callable[[str], None] = print,
 ) -> tuple[BiliVideo, Path, Path, list[OcrLine]]:
     output_dir = output_dir.expanduser().resolve()
@@ -557,6 +808,22 @@ def run_bili_ocr(
     log("RapidOCR 识别中...")
     lines = extract_ocr_lines(frames, fps=fps, min_score=min_score, progress=ocr_progress)
     log(f"识别到文字行: {len(lines)}")
+
+    if speaker_labels:
+        if speaker_config is None:
+            raise BiliOcrError("启用说话人标注时必须提供 speaker_config")
+        log("说话人标注: 用视觉模型识别编号文字框的说话角色...")
+        lines = label_speakers(
+            lines,
+            frames_dir,
+            speaker_config,
+            cache_dir=output_dir / "speaker_cache",
+            fps=fps,
+            concurrency=speaker_concurrency,
+            seed_names=speaker_seed,
+            log=log,
+        )
+        log("说话人标注完成")
 
     json_path = output_dir / "ocr_lines.json"
     json_path.write_text(
