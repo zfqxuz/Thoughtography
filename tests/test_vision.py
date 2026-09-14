@@ -90,5 +90,6 @@ def test_vision_client_parses_and_clamps_lines(tmp_path: Path) -> None:
     assert url == "http://example.test/v1/chat/completions"
     assert payload["model"] == "test-vision"
     assert payload["response_format"] == {"type": "json_object"}
+    assert "max_tokens" not in payload
     image_part = payload["messages"][1]["content"][1]
     assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")

@@ -149,7 +149,6 @@ class VisionClient:
                 },
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
         }
         if self.config.json_mode:
             payload["response_format"] = {"type": "json_object"}
