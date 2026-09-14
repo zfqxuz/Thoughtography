@@ -419,6 +419,11 @@ def extract_ocr_lines(
     return merged
 
 
+def _format_mmss(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 def write_transcript(
     video: BiliVideo,
     lines: list[OcrLine],
@@ -426,30 +431,82 @@ def write_transcript(
     *,
     source_url: str,
 ) -> Path:
+    """Write a Doubao-style dialogue/narration transcript."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    total_seconds = max(0, int(round(video.duration)))
     header = [
         "=" * 80,
         video.display_title,
+        "角色对话与旁白（按时间顺序）",
         f"来源：{source_url}（UP主：{video.author}）",
-        f"视频时长：{format_timestamp(video.duration)}",
-        "说明：本文件由 RapidOCR 逐帧识别画面文字生成；【对白】表示竖排对话框，",
-        "      【字幕】表示横排字幕/文字卡。OCR 无法可靠判断具体说话角色。",
+        f"视频时长：{total_seconds // 60}分{total_seconds % 60:02d}秒",
+        "说明：本视频由 RapidOCR 逐帧识别画面字幕生成；",
+        "      台词以画面文字为准，已合并连续重复镜头。时间码为 mm:ss。",
+        "      【对白】表示竖排对话框，【字幕】表示横排字幕/旁白文字。",
+        "      OCR 无法区分具体说话角色。",
         "=" * 80,
         "",
+        "〔正文〕",
+        "",
     ]
+
     body: list[str] = []
-    last_end = -1.0
+    previous_end: float | None = None
     for line in lines:
         if line.end <= line.start:
             continue
-        if body and line.start - last_end >= 30.0:
+        if previous_end is not None and line.start - previous_end >= 2.0:
             body.append("")
-        start = format_timestamp(line.start)
         tag = "【对白】" if line.vertical else "【字幕】"
-        body.append(f"{start} {tag}{line.text}")
-        last_end = line.end
-    dest.write_text("\n".join(header + body).rstrip() + "\n", encoding="utf-8")
+        text_lines = [part for part in line.text.splitlines() if part.strip()] or [line.text]
+        body.append(f"{_format_mmss(line.start)} {tag}{text_lines[0].strip()}")
+        for extra in text_lines[1:]:
+            body.append(f"      {extra.strip()}")
+        previous_end = max(previous_end or line.end, line.end)
+
+    footer = [
+        "",
+        "=" * 80,
+        "（本视频由 RapidOCR 逐帧识别画面文字生成，已合并连续重复镜头。）",
+        "=" * 80,
+    ]
+    dest.write_text("\n".join(header + body + footer).rstrip() + "\n", encoding="utf-8")
     return dest
+
+
+def clean_ocr_lines(
+    lines: list[OcrLine],
+    *,
+    min_score: float = 0.75,
+) -> list[OcrLine]:
+    """Drop obvious OP/STAFF/song noise from OCR lines for a cleaner transcript."""
+    credit = re.compile(
+        r"(制作|作画|監督|原作|題材|脚本|演出|撮影|編集|音楽|作詞|作曲|編曲|"
+        r"プロデューサー|动画制作|使用曲|原曲|BGM|素材|協力|キャスト|主题歌|"
+        r"テーマ|オープニング|エンディング|イラスト|背景|色彩|美術|音響|"
+        r"効果|效果|映像|機車|勇者|靈障|暗号制作|提供|赞助|企画|進行|広報|"
+        r"宣伝|配信|Copyright|©|niconico|ニコニコ|Staff|Cast|Music|Sound|"
+        r"Director|Producer|Animation|Editor|Opening|Ending|donjuan|"
+        r"KOSUZU|TO BECONTINUED|YUKKURI)"
+    )
+    kept: list[OcrLine] = []
+    for line in lines:
+        value = line.text.strip()
+        if line.score < min_score or len(value) < 2:
+            continue
+        if credit.search(value):
+            continue
+        kana = sum(1 for char in value if 0x3040 <= ord(char) <= 0x30FF)
+        han = sum(1 for char in value if 0x4E00 <= ord(char) <= 0x9FFF)
+        latin = sum(1 for char in value if char.isascii() and char.isalpha())
+        if kana and kana / max(1, len(value)) > 0.2 and han < kana:
+            continue
+        if value.isascii() and len(value) < 6:
+            continue
+        if han + latin < 2:
+            continue
+        kept.append(line)
+    return kept
 
 
 def run_bili_ocr(
@@ -508,6 +565,9 @@ def run_bili_ocr(
     )
     text_path = output_dir / "对话与旁白_OCR.txt"
     write_transcript(video, lines, text_path, source_url=url)
+    clean_path = output_dir / "对话与旁白_OCR_精选.txt"
+    write_transcript(video, clean_ocr_lines(lines), clean_path, source_url=url)
     log(f"输出: {text_path}")
+    log(f"精选: {clean_path}")
     log(f"结构化: {json_path}")
     return video, video_path, text_path, lines
