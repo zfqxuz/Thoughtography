@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+bili = ["rapidocr-onnxruntime>=1.4.0"]
 
 [project.scripts]
 thoughtography = "thoughtography.cli:main"

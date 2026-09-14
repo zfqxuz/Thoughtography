@@ -46,3 +46,27 @@ thoughtography extract input.mp4 --output output/ --dry-run
 - `script.txt`：纯文本台本
 - `analysis.json`：结构化对白 / 旁白 / 角色 / 场景
 - `keyframes.json`：关键帧采样与变化分数
+
+## Bilibili OCR 插件
+
+项目内置了 DSH Skill：`.dsh/skills/bilibili-ocr/SKILL.md`。在 Thoughtography
+项目目录下启动 DSH 时会自动发现；也可以在命令行直接使用。
+
+安装 OCR 依赖：
+
+```bash
+pip install -e ".[bili]"
+```
+
+使用：
+
+```bash
+thoughtography bili 'https://b23.tv/xxxxxxx' \
+  --output output/bili-ocr/任务名 \
+  --fps 1
+```
+
+流程：peanutdl 解析下载 → ffmpeg 抽帧 → RapidOCR 识别 → 跨帧合并 →
+输出 `对话与旁白_OCR.txt` 和 `ocr_lines.json`。
+
+OCR 只负责取字，不区分具体说话角色；需要角色名时需再叠加人工或视觉模型标注。

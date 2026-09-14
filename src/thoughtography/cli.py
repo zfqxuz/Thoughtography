@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from dotenv import load_dotenv
 
+from .bili_ocr import run_bili_ocr
 from .config import ConfigError, load_provider_config, resolve_chat_url
 from .media import find_ffmpeg, find_ffprobe
 from .pipeline import run_extract
@@ -167,6 +168,33 @@ def extract(
         typer.echo("已输出 script.fountain / script.txt / analysis.json")
     if result.errors:
         typer.echo(f"失败的关键帧: {len(result.errors)} 个，详见 analysis.json")
+
+
+@app.command()
+def bili(
+    url: str = typer.Argument(..., help="Bilibili / b23.tv 链接"),
+    output: Path = typer.Option(
+        Path("output/bili-ocr"), "--output", "-o", help="下载、抽帧和文本输出目录"
+    ),
+    fps: float = typer.Option(1.0, "--fps", help="OCR 抽帧频率"),
+    min_score: float = typer.Option(0.6, "--min-score", help="OCR 置信度下限"),
+    skip_download: bool = typer.Option(
+        False, "--skip-download", help="输出目录已有视频时跳过下载"
+    ),
+) -> None:
+    """用 peanutdl 解析 B 站视频，并用 RapidOCR 逐帧提取画面字幕。"""
+    try:
+        run_bili_ocr(
+            url,
+            output,
+            fps=fps,
+            min_score=min_score,
+            skip_download=skip_download,
+            log=typer.echo,
+        )
+    except Exception as exc:  # noqa: BLE001 - CLI boundary
+        typer.secho(f"失败: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
 
 
 def main() -> None:
